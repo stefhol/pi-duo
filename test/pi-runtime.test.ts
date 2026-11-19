@@ -11,7 +11,7 @@ import assert from "node:assert/strict";
 import { mkdtemp, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { after, before, describe, it } from "node:test";
+import { after, afterEach, before, describe, it } from "node:test";
 import { startMockGitLab } from "./mock.ts";
 
 const mock = await startMockGitLab();
@@ -47,6 +47,14 @@ async function authFile(): Promise<Record<string, any>> {
 	return JSON.parse(await readFile(join(agentDir, "auth.json"), "utf8"));
 }
 
+/** Call the extension factory with the parts of pi's API it uses. */
+function fakeExtension(registrations: Array<[string, any]>, commands: string[] = []): void {
+	mod.default({
+		registerProvider: (providerId: string, config: unknown) => registrations.push([providerId, config]),
+		registerCommand: (name: string) => commands.push(name),
+	} as never);
+}
+
 before(async () => {
 	agentDir = await mkdtemp(join(tmpdir(), "pi-duo-runtime-"));
 	process.env.PI_CODING_AGENT_DIR = agentDir;
@@ -62,9 +70,7 @@ before(async () => {
 
 	// Register the same way pi's extension API does.
 	const registrations: Array<[string, any]> = [];
-	mod.default({
-		registerProvider: (providerId: string, config: unknown) => registrations.push([providerId, config]),
-	} as never);
+	fakeExtension(registrations);
 	assert.equal(registrations.length, 1);
 	assert.equal(registrations[0]?.[0], "gitlab-duo");
 	runtime.registerProvider(registrations[0]![0], registrations[0]![1]);
@@ -82,12 +88,16 @@ describe("provider registration", () => {
 		assert.equal(runtime.getProvider("gitlab-duo")?.name, "GitLab Duo");
 	});
 
+	it("registers the /duo-models diagnostic command", () => {
+		const commands: string[] = [];
+		fakeExtension([], commands);
+		assert.deepEqual(commands, ["duo-models"]);
+	});
+
 	it("registers the GITLAB_TOKEN fallback only when the variable is set", () => {
 		const capture = () => {
 			const registrations: Array<[string, any]> = [];
-			mod.default({
-				registerProvider: (providerId: string, config: unknown) => registrations.push([providerId, config]),
-			} as never);
+			fakeExtension(registrations);
 			return registrations[0]![1];
 		};
 		assert.equal(capture().apiKey, undefined, "no key config, so pi reports the provider as unconfigured");
@@ -159,6 +169,43 @@ describe("/login flow", () => {
 		}
 		// The earlier credential is still the one in place (no half-written entry).
 		assert.equal((await authFile())["gitlab-duo"].access, "glpat-from-login");
+	});
+});
+
+describe("model refresh", () => {
+	afterEach(async () => {
+		mock.state.anthropicModels = undefined;
+		mock.state.openaiModels = undefined;
+		mod.resetModelCatalog();
+		await runtime.refresh({ providers: ["gitlab-duo"], allowNetwork: false, force: true });
+	});
+
+	it("replaces the registered models with what the gateway proxies list", async () => {
+		mock.state.anthropicModels = [{ id: "claude-opus-9-20260301", display_name: "Claude Opus 9" }];
+		mock.state.openaiModels = ["gpt-6.1-sol-2026-01-15"];
+
+		const result = await runtime.refresh({ providers: ["gitlab-duo"], allowNetwork: true, force: true });
+		assert.equal(result.errors.size, 0, [...result.errors.values()].map((error) => error.message).join("; "));
+
+		const models = runtime.getModels("gitlab-duo");
+		assert.deepEqual(
+			models.map((model) => model.id).sort(),
+			["claude-opus-9-20260301", "gpt-6.1-sol-2026-01-15"],
+			"the stored PAT must reach refreshModels and the discovery must replace the fallback list",
+		);
+		const sol = runtime.getModel("gitlab-duo", "gpt-6.1-sol-2026-01-15");
+		assert.ok(sol);
+		assert.equal(sol.name, "GPT 6.1 Sol");
+	});
+
+	it("does not call the gateway when the network is disallowed", async () => {
+		mock.requests.length = 0;
+		await runtime.refresh({ providers: ["gitlab-duo"], allowNetwork: false, force: true });
+		assert.equal(
+			mock.requests.filter((request) => request.path.includes("/models")).length,
+			0,
+			"an offline refresh must not hit the model-list endpoints",
+		);
 	});
 });
 

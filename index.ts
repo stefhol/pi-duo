@@ -14,6 +14,11 @@
  *     Duo Self-Hosted / Local AI Gateway deployments.
  *   - The direct-access token cache is keyed by host + token and honours
  *     the server-provided `expires_at`.
+ *   - The model list is discovered from the AI gateway proxy
+ *     (`GET /ai/v1/proxy/{anthropic,openai}/v1/models`) through pi's
+ *     `refreshModels` hook, so `/model` matches what the instance actually
+ *     serves. The vendored list below is only a fallback for a failed
+ *     discovery.
  *
  * Usage:
  *   pi        # /login -> GitLab Duo -> instance URL, PAT
@@ -30,11 +35,12 @@ import {
 	type OAuthCredentials,
 	type OAuthLoginCallbacks,
 	openAIResponsesApi,
+	type RefreshModelsContext,
 	type SimpleStreamOptions,
 	type ThinkingLevelMap,
 	type TranscriptContext,
 } from "@earendil-works/pi-ai/compat";
-import { type ExtensionAPI, readStoredCredential } from "@earendil-works/pi-coding-agent";
+import { type ExtensionAPI, type ProviderModelConfig, readStoredCredential } from "@earendil-works/pi-coding-agent";
 
 // =============================================================================
 // Constants
@@ -218,7 +224,123 @@ export const MODELS: GitLabModel[] = [
 	},
 ];
 
-const MODEL_MAP = new Map(MODELS.map((m) => [m.id, m]));
+// =============================================================================
+// Model catalog
+// =============================================================================
+
+/**
+ * Cost/limit metadata for a discovered model id.
+ *
+ * The proxy model list carries ids (and occasionally display names) but no
+ * pricing or limits, so this table is a family heuristic. Context windows are
+ * deliberately conservative: pi compacts a little early instead of sending a
+ * request the model rejects. Costs are Anthropic/OpenAI list prices and can
+ * differ under an enterprise agreement. Add a rule when a family needs better
+ * numbers; a new family falls back to `FALLBACK_META` rather than break.
+ */
+interface ModelFamily {
+	match: RegExp;
+	backend: Backend;
+	contextWindow: number;
+	maxTokens: number;
+	cost: GitLabModel["cost"];
+}
+
+const MODEL_FAMILIES: ModelFamily[] = [
+	// Anthropic proxy
+	{ match: /opus/i, backend: "anthropic", contextWindow: 200000, maxTokens: 32000, cost: { input: 15, output: 75, cacheRead: 1.5, cacheWrite: 18.75 } },
+	{ match: /sonnet/i, backend: "anthropic", contextWindow: 200000, maxTokens: 64000, cost: { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75 } },
+	{ match: /haiku/i, backend: "anthropic", contextWindow: 200000, maxTokens: 8192, cost: { input: 1, output: 5, cacheRead: 0.1, cacheWrite: 1.25 } },
+	// OpenAI proxy
+	{ match: /codex/i, backend: "openai", contextWindow: 128000, maxTokens: 16384, cost: { input: 2.5, output: 10, cacheRead: 0, cacheWrite: 0 } },
+	{ match: /(mini|nano)/i, backend: "openai", contextWindow: 128000, maxTokens: 16384, cost: { input: 0.15, output: 0.6, cacheRead: 0, cacheWrite: 0 } },
+	{ match: /gpt/i, backend: "openai", contextWindow: 128000, maxTokens: 16384, cost: { input: 2.5, output: 10, cacheRead: 0, cacheWrite: 0 } },
+];
+
+const FALLBACK_META: Pick<GitLabModel, "contextWindow" | "maxTokens" | "cost"> = {
+	contextWindow: 128000,
+	maxTokens: 16384,
+	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+};
+
+const NAME_WORDS: Record<string, string> = {
+	gpt: "GPT",
+	claude: "Claude",
+	codex: "Codex",
+	mini: "Mini",
+	nano: "Nano",
+	sol: "Sol",
+	turbo: "Turbo",
+};
+
+/** `gpt-6.1-sol-2026-01-15` -> `GPT 6.1 Sol`; a display name from the API wins. */
+export function prettifyModelId(id: string): string {
+	const base = id.replace(/[-_](\d{8}|\d{4}-\d{2}-\d{2})$/u, "");
+	return base
+		.split(/[-_\s]+/u)
+		.filter(Boolean)
+		.map((word) => NAME_WORDS[word.toLowerCase()] ?? word.charAt(0).toUpperCase() + word.slice(1))
+		.join(" ");
+}
+
+function backendBaseUrl(backend: Backend): string {
+	return backend === "anthropic" ? ANTHROPIC_PROXY_URL : OPENAI_PROXY_URL;
+}
+
+function metaFor(id: string, backend: Backend) {
+	const family = MODEL_FAMILIES.find((entry) => entry.backend === backend && entry.match.test(id));
+	const limits = family ?? FALLBACK_META;
+	return {
+		reasoning: true,
+		...(backend === "anthropic" ? { thinkingLevelMap: { xhigh: "max" } as ThinkingLevelMap } : {}),
+		input: ["text", "image"] as ("text" | "image")[],
+		cost: { ...limits.cost },
+		contextWindow: limits.contextWindow,
+		maxTokens: limits.maxTokens,
+	};
+}
+
+/** Build a catalog entry for an id the proxy listed (or that pi handed us). */
+export function modelFromId(id: string, backend: Backend, name?: string): GitLabModel {
+	return {
+		id,
+		name: name?.trim() || prettifyModelId(id),
+		backend,
+		baseUrl: backendBaseUrl(backend),
+		...metaFor(id, backend),
+	};
+}
+
+/** Live catalog: the static fallback until a discovery replaces it. */
+const catalog = new Map<string, GitLabModel>(MODELS.map((model) => [model.id, model]));
+
+/** Models currently offered to pi. */
+export function modelCatalog(): GitLabModel[] {
+	return [...catalog.values()];
+}
+
+/** Replace the catalog (after a discovery, or in tests). */
+export function setModelCatalog(models: GitLabModel[]): void {
+	catalog.clear();
+	for (const model of models) catalog.set(model.id, model);
+}
+
+/** Restore the vendored fallback list. */
+export function resetModelCatalog(): void {
+	setModelCatalog(MODELS);
+}
+
+/**
+ * Config for a model id, inferring backend and metadata when discovery has not
+ * seen it (e.g. a `models.json` override, or a stale picker entry).
+ */
+export function modelConfig(id: string): GitLabModel {
+	const known = catalog.get(id);
+	if (known) return known;
+	const inferred = modelFromId(id, /claude/i.test(id) ? "anthropic" : "openai");
+	catalog.set(id, inferred);
+	return inferred;
+}
 
 // =============================================================================
 // Project context (diagnostics / parity only)
@@ -350,6 +472,139 @@ async function getDirectAccessToken(
 }
 
 // =============================================================================
+// Model discovery
+// =============================================================================
+
+/** Cap discovery so a hanging gateway cannot hold up startup or /model. */
+const DISCOVERY_TIMEOUT_MS = 8000;
+
+/** Ids the OpenAI account lists that cannot be driven through /v1/responses. */
+const NON_CHAT_OPENAI = /embedding|whisper|tts|transcribe|dall-e|moderation|audio|realtime|image|sora|search|babbage|davinci|instruct/i;
+
+let lastDiscoveryError: string | undefined;
+
+/** Last discovery failure, for the `/duo-models` diagnostic. */
+export function discoveryError(): string | undefined {
+	return lastDiscoveryError;
+}
+
+interface ProxyModelEntry {
+	id: string;
+	name?: string;
+}
+
+/**
+ * Both proxies answer with a list envelope (`data`, or `models` for the
+ * definitions-style payload) whose entries carry `id`/`identifier` and
+ * optionally a human name.
+ */
+function parseModelList(payload: unknown): ProxyModelEntry[] {
+	const record = payload as { data?: unknown; models?: unknown } | undefined;
+	const list = Array.isArray(payload) ? payload : Array.isArray(record?.data) ? record.data : Array.isArray(record?.models) ? record.models : [];
+	const entries: ProxyModelEntry[] = [];
+	for (const raw of list) {
+		if (!raw || typeof raw !== "object") continue;
+		const entry = raw as Record<string, unknown>;
+		const id = typeof entry.id === "string" ? entry.id : typeof entry.identifier === "string" ? entry.identifier : undefined;
+		if (!id) continue;
+		const name =
+			typeof entry.display_name === "string"
+				? entry.display_name
+				: typeof entry.name === "string"
+					? entry.name
+					: undefined;
+		entries.push({ id, name });
+	}
+	return entries;
+}
+
+async function fetchProxyModels(
+	url: string,
+	backend: Backend,
+	headers: Record<string, string>,
+	signal: AbortSignal,
+): Promise<GitLabModel[]> {
+	const response = await fetch(url, { headers, signal });
+	if (!response.ok) throw new Error(`${url} answered ${response.status}`);
+	const entries = parseModelList(await response.json());
+	return entries
+		.filter(({ id }) => backend === "anthropic" || !NON_CHAT_OPENAI.test(id))
+		.map(({ id, name }) => modelFromId(id, backend, name));
+}
+
+/**
+ * Ask the gateway proxies what this instance serves. Uses the same short-lived
+ * gateway token and headers as a completion, so the answer reflects the unit
+ * primitive that pi actually calls. Either proxy failing is tolerated as long
+ * as the other returns something.
+ */
+export async function discoverModels(pat: string, signal?: AbortSignal): Promise<GitLabModel[]> {
+	const directAccess = await getDirectAccessToken(pat, signal);
+	const headers = { ...directAccess.headers, Authorization: `Bearer ${directAccess.token}` };
+	const timeout = AbortSignal.timeout(DISCOVERY_TIMEOUT_MS);
+	const scoped = signal ? AbortSignal.any([signal, timeout]) : timeout;
+
+	const [anthropic, openai] = await Promise.allSettled([
+		fetchProxyModels(`${ANTHROPIC_PROXY_URL}v1/models`, "anthropic", headers, scoped),
+		fetchProxyModels(`${OPENAI_PROXY_URL}/models`, "openai", headers, scoped),
+	]);
+
+	const models = [anthropic, openai].flatMap((result) => (result.status === "fulfilled" ? result.value : []));
+	if (models.length === 0) {
+		const reasons = [anthropic, openai]
+			.map((result) =>
+				result.status === "rejected"
+					? result.reason instanceof Error
+						? result.reason.message
+						: String(result.reason)
+					: "listed no models",
+			)
+			.join("; ");
+		throw new Error(`No models discovered from the GitLab AI gateway (${reasons})`);
+	}
+	return models;
+}
+
+function patFromCredential(credential: RefreshModelsContext["credential"]): string | undefined {
+	if (!credential) return undefined;
+	if (credential.type === "oauth" && credential.access) return credential.access;
+	if (credential.type === "api_key" && credential.key) return credential.key;
+	return undefined;
+}
+
+function providerModels(): ProviderModelConfig[] {
+	return modelCatalog().map(({ id, name, reasoning, thinkingLevelMap, input, cost, contextWindow, maxTokens }) => ({
+		type: "chat" as const,
+		id,
+		name,
+		reasoning,
+		thinkingLevelMap,
+		input,
+		cost,
+		contextWindow,
+		maxTokens,
+	}));
+}
+
+/**
+ * pi's `refreshModels` hook: replace the catalog with what the instance serves.
+ * Never throws and never empties the list — a failed discovery keeps the
+ * previous catalog, so `/model` degrades to the vendored fallback instead of
+ * breaking.
+ */
+export async function refreshDuoModels(context: RefreshModelsContext): Promise<ProviderModelConfig[]> {
+	const pat = patFromCredential(context.credential) ?? process.env.GITLAB_TOKEN;
+	if (!pat || context.allowNetwork === false) return providerModels();
+	try {
+		setModelCatalog(await discoverModels(pat, context.signal));
+		lastDiscoveryError = undefined;
+	} catch (error) {
+		lastDiscoveryError = error instanceof Error ? error.message : String(error);
+	}
+	return providerModels();
+}
+
+// =============================================================================
 // Login (instance URL + personal access token)
 // =============================================================================
 
@@ -452,8 +707,7 @@ export function streamGitLabDuo(
 				);
 			}
 
-			const cfg = MODEL_MAP.get(model.id);
-			if (!cfg) throw new Error(`Unknown model: ${model.id}`);
+			const cfg = modelConfig(model.id);
 
 			const directAccess = await getDirectAccessToken(gitlabAccessToken, options?.signal);
 			const modelWithBaseUrl = { ...model, baseUrl: cfg.baseUrl };
@@ -524,22 +778,45 @@ export default function (pi: ExtensionAPI) {
 		// provider as unconfigured.
 		...(process.env.GITLAB_TOKEN ? { apiKey: "$GITLAB_TOKEN" } : {}),
 		api: "gitlab-duo-api",
-		models: MODELS.map(({ id, name, reasoning, thinkingLevelMap, input, cost, contextWindow, maxTokens }) => ({
-			id,
-			name,
-			reasoning,
-			thinkingLevelMap,
-			input,
-			cost,
-			contextWindow,
-			maxTokens,
-		})),
+		// Fallback list until `refreshModels` replaces it with what the gateway serves.
+		models: providerModels(),
+		refreshModels: refreshDuoModels,
 		streamSimple: streamGitLabDuo,
 		oauth: {
 			name: "GitLab Duo (instance URL + token)",
 			login: loginGitLabPat,
 			refreshToken: passthroughRefresh,
 			getApiKey: (cred) => cred.access,
+		},
+	});
+
+	pi.registerCommand("duo-models", {
+		description: "List GitLab Duo models discovered from the instance; add \"refresh\" to probe again",
+		handler: async (args, ctx) => {
+			if (/\brefresh\b/i.test(args)) {
+				await ctx.modelRegistry.refresh({ providers: [PROVIDER_ID], force: true });
+			}
+			const available = ctx.modelRegistry.getAvailable().filter((model) => model.provider === PROVIDER_ID);
+			if (available.length === 0) {
+				ctx.ui.notify("GitLab Duo: no models. Run /login gitlab-duo first.", "warning");
+				return;
+			}
+			const lines = available.map(
+				(model) => `- \`${model.id}\` — ${model.name} (${modelConfig(model.id).backend} proxy)`,
+			);
+			const error = discoveryError();
+			pi.sendMessage({
+				customType: "gitlab-duo-models",
+				display: true,
+				content: [
+					`**GitLab Duo models** (${available.length} on ${gitlabHost()})`,
+					"",
+					...lines,
+					...(error ? ["", `Last discovery error: ${error}`] : []),
+					"",
+					"Run `/duo-models refresh` after a gateway upgrade, or `/reload` after editing the extension.",
+				].join("\n"),
+			});
 		},
 	});
 }
