@@ -5,21 +5,20 @@
  * credential first, then GITLAB_HOST / GITLAB_TOKEN.
  *
  * Run:
- *   node smoke.ts                          # default model
+ *   node smoke.ts --list                    # what this instance's gateway serves
+ *   node smoke.ts                           # default model
  *   node smoke.ts claude-sonnet-4-5-20250929 --thinking
- *   GITLAB_HOST=https://gitlab.example.com GITLAB_TOKEN=glpat-... node smoke.ts gpt-5.1-2025-11-13
+ *   GITLAB_HOST=https://gitlab.example.com GITLAB_TOKEN=glpat-... node smoke.ts gpt-6.1-sol-2026-01-15
  */
 
 import { readStoredCredential } from "@earendil-works/pi-coding-agent";
-import { MODELS, gitlabHost, streamGitLabDuo } from "./index.ts";
+import { discoverModels, gitlabHost, modelCatalog, modelConfig, streamGitLabDuo } from "./index.ts";
 
 interface StoredDuoCredential {
 	access?: string;
 	instanceUrl?: string;
 	refresh?: string;
 }
-
-const MODEL_MAP = new Map(MODELS.map((model) => [model.id, model]));
 
 function credentials(): { token: string; host: string } {
 	const stored = readStoredCredential("gitlab-duo") as StoredDuoCredential | undefined;
@@ -30,16 +29,21 @@ function credentials(): { token: string; host: string } {
 }
 
 async function main() {
-	const modelId = process.argv[2] ?? "claude-sonnet-4-5-20250929";
-	const thinking = process.argv.includes("--thinking");
-	const cfg = MODEL_MAP.get(modelId);
-	if (!cfg) {
-		console.error(`Unknown model: ${modelId}`);
-		console.error("Available:", [...MODEL_MAP.keys()].join(", "));
-		process.exit(1);
+	const args = process.argv.slice(2);
+	const thinking = args.includes("--thinking");
+	const modelId = args.find((argument) => !argument.startsWith("--")) ?? "claude-sonnet-4-5-20250929";
+	const { token, host } = credentials();
+
+	if (args.includes("--list")) {
+		const models = await discoverModels(token);
+		console.log(`${models.length} models discovered on ${host}:`);
+		for (const entry of models) {
+			console.log(`  ${entry.backend.padEnd(9)} ${entry.id.padEnd(40)} ${entry.name}`);
+		}
+		return;
 	}
 
-	const { token, host } = credentials();
+	const cfg = modelConfig(modelId);
 	console.log(`Instance: ${host}`);
 	console.log(`Model: ${cfg.id} (${cfg.backend}${thinking ? ", thinking" : ""})`);
 
@@ -67,6 +71,7 @@ async function main() {
 		else if (event.type === "text_delta") process.stdout.write(event.delta);
 		else if (event.type === "error") {
 			console.error("\nError:", event.error.errorMessage);
+			console.error("Known ids:", modelCatalog().map((entry) => entry.id).join(", "));
 			process.exitCode = 1;
 		} else if (event.type === "done") {
 			console.log("\nDone:", event.reason, event.message.usage);

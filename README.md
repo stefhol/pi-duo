@@ -3,12 +3,13 @@
 GitLab Duo as a pi provider, for **self-managed GitLab too**.
 
 `/login` asks for your instance URL and a personal access token, validates them, stores
-them, and every request mints a short-lived gateway token against that instance. Model
-choice then happens in `/model` as usual.
+them, and every request mints a short-lived gateway token against that instance. `/model`
+then lists the models **your instance actually serves** — the extension asks both gateway
+proxies for their model list instead of shipping a frozen catalog (see [Models](#models)).
 
 Based on pi 1.5.2's `examples/extensions/custom-provider-gitlab-duo`, with the hardcoded
-`gitlab.com` / `cloud.gitlab.com` hosts replaced by configuration and a PAT login instead
-of the gitlab.com OAuth app.
+`gitlab.com` / `cloud.gitlab.com` hosts replaced by configuration, a PAT login instead of
+the gitlab.com OAuth app, and model discovery instead of the example's vendored list.
 
 ## Install
 
@@ -70,10 +71,36 @@ instead of "not configured"). Everything else goes through the login flow.
 
 ## Models
 
-The model list is the vendored one from pi 1.5.2 (Claude Opus/Sonnet/Haiku via the
-Anthropic proxy, GPT-5.x via the OpenAI Responses proxy). Model choice is not restricted
-by namespace on self-managed instances, so `/model` is the place to pick one. If your
-instance offers models this list lacks, add entries to `MODELS` in `index.ts`.
+The model list is **discovered from your instance**, not hardcoded. When pi refreshes its
+model catalogs (startup, and each time `/model` opens), the extension calls
+`refreshModels`, mints the short-lived direct-access token with your stored PAT, and asks
+both gateway proxies what they serve:
+
+```
+GET ${GITLAB_AI_GATEWAY_URL}/ai/v1/proxy/anthropic/v1/models
+GET ${GITLAB_AI_GATEWAY_URL}/ai/v1/proxy/openai/v1/models
+```
+
+Each proxy's ids become selectable models (`[gitlab-duo]` in `/model`), routed back to the
+same proxy they came from. The names come from the proxy's `display_name` where present,
+otherwise from the id. Non-chat OpenAI ids (embeddings, audio, images, …) are filtered
+out. `refreshModels` never throws and never empties the list: a failed discovery — no PAT
+yet, offline, self-hosted gateway without the endpoint — keeps the previous catalog, and
+the vendored pi 1.5.2 list at the top of `index.ts` is the initial fallback.
+
+Inspect at any time:
+
+```
+/duo-models            # models pi currently has for this provider
+/duo-models refresh    # probe both proxies again
+node smoke.ts --list   # same discovery outside pi (needs GITLAB_HOST + GITLAB_TOKEN)
+```
+
+Costs, context windows and max output tokens are **not** part of the proxy listing, so
+`MODEL_FAMILIES` in `index.ts` covers them with per-family defaults (Opus/Sonnet/Haiku,
+GPT/Codex/Mini). Those numbers are list prices and conservative limits: pi compacts a
+little early rather than sending a request the model rejects. Add a family rule when a new
+model needs better numbers.
 
 ## Self-managed prerequisites
 
@@ -115,9 +142,12 @@ npm run smoke     # live request with your stored/login credentials
 ```
 
 `test/local.test.ts` covers login validation, host precedence, token caching and expiry,
-header precedence (proxy headers must win over Duo Workflow headers) and both streaming
-backends. `test/pi-runtime.test.ts` drives pi's own `ModelRuntime` — the same code path
-`/login` takes — and asserts the credential round trip through `auth.json`.
+header precedence (proxy headers must win over Duo Workflow headers), both streaming
+backends, model discovery (filtering, naming, metadata, failure fallback) and streaming a
+model that only the discovery knows about. `test/pi-runtime.test.ts` drives pi's own
+`ModelRuntime` — the same code path `/login` and `/model` take — and asserts the credential
+round trip through `auth.json` plus the `refreshModels` hook publishing the discovered
+catalog.
 
 ## Notes
 

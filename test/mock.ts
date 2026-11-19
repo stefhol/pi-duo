@@ -22,6 +22,12 @@ export interface MockState {
 	expiresAt?: string;
 	/** Increments with every minted gateway token. */
 	tokenSerial: number;
+	/** Ids listed by the Anthropic proxy; unset = 404 (no discovery). */
+	anthropicModels?: Array<string | { id: string; display_name?: string }>;
+	/** Ids listed by the OpenAI proxy; unset = 404 (no discovery). */
+	openaiModels?: string[];
+	/** Status for both model-list endpoints while > 0. */
+	modelsStatus: number;
 }
 
 export interface MockGitLab {
@@ -142,7 +148,7 @@ function openAIStream(res: ServerResponse) {
 
 export async function startMockGitLab(): Promise<MockGitLab> {
 	const requests: Recorded[] = [];
-	const state: MockState = { userStatus: 200, directAccessStatus: 0, tokenSerial: 0 };
+	const state: MockState = { userStatus: 200, directAccessStatus: 0, tokenSerial: 0, modelsStatus: 0 };
 
 	const server = createServer((req, res) => {
 		let body = "";
@@ -192,6 +198,31 @@ export async function startMockGitLab(): Promise<MockGitLab> {
 							duo_workflow_service: { headers: { "x-gitlab-unit-primitive": "duo_agent_platform" } },
 						}),
 					);
+				return;
+			}
+
+			if (path === "/ai/v1/proxy/anthropic/v1/models" || path === "/ai/v1/proxy/openai/v1/models") {
+				if (state.modelsStatus > 0) {
+					res.writeHead(state.modelsStatus).end("no model list");
+					return;
+				}
+				const anthropic = path.includes("/anthropic/");
+				const ids = anthropic ? state.anthropicModels : state.openaiModels;
+				if (!ids) {
+					res.writeHead(404).end("no model list");
+					return;
+				}
+				res.writeHead(200, { "content-type": "application/json" }).end(
+					JSON.stringify({
+						data: ids.map((entry) => {
+							const id = typeof entry === "string" ? entry : entry.id;
+							const name = typeof entry === "string" ? undefined : entry.display_name;
+							return anthropic
+								? { type: "model", id, ...(name ? { display_name: name } : {}) }
+								: { object: "model", id };
+						}),
+					}),
+				);
 				return;
 			}
 

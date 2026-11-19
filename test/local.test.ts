@@ -13,7 +13,7 @@ import { execFileSync } from "node:child_process";
 import { mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { after, before, describe, it } from "node:test";
+import { after, afterEach, before, describe, it } from "node:test";
 import { startMockGitLab, type Recorded } from "./mock.ts";
 
 const mock = await startMockGitLab();
@@ -464,6 +464,148 @@ describe("streamGitLabDuo", () => {
 		const error = events.find((event) => event.type === "error");
 		assert.ok(error);
 		assert.match(error.error.errorMessage, /No GitLab access token/);
+	});
+});
+
+describe("model discovery", () => {
+	afterEach(() => {
+		state.anthropicModels = undefined;
+		state.openaiModels = undefined;
+		state.modelsStatus = 0;
+		mod.resetModelCatalog();
+	});
+
+	async function refresh() {
+		return mod.refreshDuoModels({
+			credential: {
+				type: "oauth",
+				access: "glpat-test",
+				instanceUrl: gateway,
+				refresh: gateway,
+				expires: Date.now() + 1e12,
+			},
+			allowNetwork: true,
+			signal: new AbortController().signal,
+			publish: async () => true,
+		} as any);
+	}
+
+	it("asks both proxies for their model list with the gateway token", async () => {
+		state.anthropicModels = [{ id: "claude-opus-9-20260301", display_name: "Claude Opus 9" }, "claude-sonnet-4-5-20250929"];
+		state.openaiModels = ["gpt-6.1-sol-2026-01-15", "text-embedding-3-large"];
+		requests.length = 0;
+		state.tokenSerial = 0;
+		state.expiresAt = undefined;
+		mod.invalidateDirectAccessToken();
+
+		const models = await mod.discoverModels("glpat-test");
+
+		assert.deepEqual(
+			models.map((entry) => entry.id),
+			["claude-opus-9-20260301", "claude-sonnet-4-5-20250929", "gpt-6.1-sol-2026-01-15"],
+			"embedding models must not appear as chat models",
+		);
+
+		const listRequest = requests.find((request) => request.path === "/ai/v1/proxy/anthropic/v1/models");
+		assert.ok(listRequest, "expected the Anthropic model list to be requested");
+		assert.equal(listRequest.headers.authorization, "Bearer gateway-token-1");
+		assert.equal(listRequest.headers["x-gitlab-unit-primitive"], "ai_gateway_model_provider_proxy");
+		assert.ok(requests.some((request) => request.path === "/ai/v1/proxy/openai/v1/models"));
+
+		const [opus, , sol] = models as [typeof models[number], typeof models[number], typeof models[number]];
+		assert.equal(opus.backend, "anthropic");
+		assert.equal(opus.name, "Claude Opus 9", "the proxy display name wins");
+		assert.equal(opus.baseUrl, `${gateway}/ai/v1/proxy/anthropic/`);
+		assert.equal(opus.contextWindow, 200000);
+		assert.equal(opus.maxTokens, 32000);
+		assert.equal(opus.thinkingLevelMap?.xhigh, "max");
+		assert.equal(opus.reasoning, true);
+		assert.equal(sol.backend, "openai");
+		assert.equal(sol.baseUrl, `${gateway}/ai/v1/proxy/openai/v1`);
+		assert.equal(sol.name, "GPT 6.1 Sol", "a dated id gets a readable name");
+	});
+
+	it("never empties the catalog when discovery fails", async () => {
+		state.modelsStatus = 500;
+		mod.invalidateDirectAccessToken();
+
+		await assert.rejects(mod.discoverModels("glpat-test"), /No models discovered .* answered 500/);
+		const models = await refresh();
+
+		assert.equal(models.length, mod.MODELS.length, "the vendored fallback survives a failed discovery");
+		assert.match(mod.discoveryError() ?? "", /answered 500/);
+	});
+
+	it("keeps the previous catalog when a later discovery fails", async () => {
+		state.anthropicModels = ["claude-haiku-9-20270101"];
+		await refresh();
+		assert.deepEqual(mod.modelCatalog().map((entry) => entry.id), ["claude-haiku-9-20270101"]);
+
+		state.modelsStatus = 503;
+		mod.invalidateDirectAccessToken();
+		await refresh();
+		assert.deepEqual(
+			mod.modelCatalog().map((entry) => entry.id),
+			["claude-haiku-9-20270101"],
+			"a failed refresh must not drop the working catalog",
+		);
+	});
+
+	it("skips the network when pi runs offline", async () => {
+		requests.length = 0;
+		const models = await mod.refreshDuoModels({
+			credential: { type: "oauth", access: "glpat-test", refresh: gateway, expires: Date.now() + 1e12 },
+			allowNetwork: false,
+			signal: new AbortController().signal,
+			publish: async () => true,
+		} as any);
+		assert.equal(models.length, mod.MODELS.length);
+		assert.equal(requests.length, 0, "allowNetwork: false must not mint a token or hit the gateway");
+	});
+
+	it("streams a discovered model through the proxy its family belongs to", async () => {
+		state.anthropicModels = ["claude-haiku-9-20270101"];
+		await refresh();
+		requests.length = 0;
+		state.tokenSerial = 0;
+		mod.invalidateDirectAccessToken();
+
+		const cfg = mod.modelConfig("claude-haiku-9-20270101");
+		assert.equal(cfg.backend, "anthropic");
+		assert.equal(cfg.maxTokens, 8192, "family metadata applies to a model the fallback list never knew");
+
+		const events = await consume(
+			mod.streamGitLabDuo(
+				{
+					id: cfg.id,
+					name: cfg.name,
+					api: "gitlab-duo-api" as any,
+					provider: "gitlab-duo",
+					baseUrl: cfg.baseUrl,
+					reasoning: cfg.reasoning,
+					input: cfg.input,
+					cost: cfg.cost,
+					contextWindow: cfg.contextWindow,
+					maxTokens: cfg.maxTokens,
+				} as any,
+				{ messages: [{ role: "user", content: "hi", timestamp: Date.now() }] } as any,
+				{ apiKey: "glpat-test", maxTokens: 32 },
+			),
+		);
+
+		const error = events.find((event) => event.type === "error");
+		assert.equal(error, undefined, error?.error?.errorMessage);
+		assert.ok(
+			requests.some((request) => request.path === "/ai/v1/proxy/anthropic/v1/messages"),
+			"a discovered Claude model must use the Anthropic proxy",
+		);
+	});
+
+	it("infers an OpenAI backend for an unknown id", () => {
+		mod.resetModelCatalog();
+		const cfg = mod.modelConfig("gpt-7-unreleased");
+		assert.equal(cfg.backend, "openai");
+		assert.equal(cfg.baseUrl, `${gateway}/ai/v1/proxy/openai/v1`);
 	});
 });
 
